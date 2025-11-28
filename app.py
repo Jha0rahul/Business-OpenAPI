@@ -1618,8 +1618,9 @@ def main():
     logger.info("  GET  /                    - 管理面板")
     logger.info("=" * 60)
     
-    app.run(host='0.0.0.0', port=CONFIG.PORT, debug=False)
+    app.run(host='0.0.0.0', port=CONFIG["port"], debug=False)
 
 
 if __name__ == '__main__':
     main()
+
