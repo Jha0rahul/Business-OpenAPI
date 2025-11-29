@@ -9,6 +9,9 @@ import logging
 import hashlib
 import threading
 import queue
+import random
+import string
+import concurrent.futures
 from typing import Optional, Dict, List, Tuple
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
@@ -24,7 +27,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==================== 全局配置 ====================
 CONFIG = {
-    #开放端口
+    # 开放端口
     "port": os.getenv("PORT", "3000"),
     
     # 管理员密钥（优先从环境变量读取）
@@ -33,19 +36,35 @@ CONFIG = {
     # 注册服务URL前缀（从环境变量读取）
     "register_service_url": os.getenv("REGISTER_SERVICE_URL", "http://localhost:5000"),
 
-    #注册服务管理员密钥（从环境变量读取）
+    # 注册服务管理员密钥（从环境变量读取）
     "register_admin_key": os.getenv("REGISTER_ADMIN_KEY", "sk-admin-token"),
+    
     # 账号生命周期（秒）- 默认12小时
     "account_lifetime": int(os.getenv("ACCOUNT_LIFETIME", 43200)),
     
     # 提前刷新时间（秒）- 默认1小时
     "refresh_before_expiry": int(os.getenv("REFRESH_BEFORE_EXPIRY", 3600)),
     
-    # 刷新队列批量大小
-    "refresh_batch_size": int(os.getenv("REFRESH_BATCH_SIZE", 1)),
-    
     # 最大重试次数
     "max_retries": int(os.getenv("MAX_RETRIES", 10)),
+    
+    # 刷新失败禁用时间（秒）- 默认12小时
+    "refresh_fail_disable_time": int(os.getenv("REFRESH_FAIL_DISABLE_TIME", 43200)),
+    
+    # 并发刷新数量 - 默认4
+    "max_concurrent_refresh": int(os.getenv("MAX_CONCURRENT_REFRESH", 4)),
+    
+    # 每个账号请求次数后切换 - 默认5
+    "requests_per_account": int(os.getenv("REQUESTS_PER_ACCOUNT", 5)),
+    
+    # 刷新最大重试次数 - 默认2
+    "max_refresh_retries": int(os.getenv("MAX_REFRESH_RETRIES", 2)),
+    
+    # 自动创建账号开关 - 默认关闭
+    "auto_create_account": os.getenv("AUTO_CREATE_ACCOUNT", "false").lower() == "true",
+    
+    # 自动创建账号间隔（秒）- 默认1小时
+    "auto_create_interval": int(os.getenv("AUTO_CREATE_INTERVAL", 3600)),
     
     # 模型映射配置
     "models": {
@@ -170,7 +189,6 @@ def parse_iso_datetime(dt_str: str) -> Optional[datetime]:
     if not dt_str:
         return None
     try:
-        # 尝试多种格式
         for fmt in [
             "%Y-%m-%dT%H:%M:%S.%f",
             "%Y-%m-%dT%H:%M:%S",
@@ -216,6 +234,11 @@ def get_headers(jwt: str) -> Dict:
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "x-server-timeout": "1800",
     }
+
+
+def generate_random_username(length: int = 12) -> str:
+    """生成随机用户名"""
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
 # ==================== JWT管理模块 ====================
 class JWTManager:
@@ -431,16 +454,61 @@ class AccountRefreshService:
             "Content-Type": "application/json"
         }
     
+    def create_account(self, username: Optional[str] = None) -> Optional[Dict]:
+        """
+        创建新账号
+        返回账号信息，失败返回None
+        """
+        try:
+            if not username:
+                username = generate_random_username()
+            
+            url = f"{self.base_url}/api/accounts"
+            body = {"username": username}
+
+            logger.info(f"开始创建账号: {username}")
+            
+            resp = requests.post(url, headers=self._get_auth_headers(), json=body, timeout=120)
+            
+            if resp.status_code == 429:
+                logger.warning(f"创建账号请求被限流")
+                return None
+            
+            if resp.status_code != 200:
+                logger.warning(f"创建账号请求失败: {resp.status_code} - {resp.text}")
+                return None
+            
+            data = resp.json()
+            if not data.get("success"):
+                logger.warning(f"创建账号失败: {data.get('error')}")
+                return None
+            
+            account = data.get("account", {})
+            if account.get("status") == "success" and account.get("is_complete"):
+                logger.info(f"账号创建成功: {account.get('email')}")
+                return {
+                    "email": account.get("email"),
+                    "secure_c_ses": account.get("c_ses"),
+                    "host_c_oses": account.get("c_oses"),
+                    "csesidx": account.get("csesidx"),
+                    "team_id": account.get("config_id"),
+                    "created_at": account.get("created_at"),
+                    "updated_at": account.get("updated_at"),
+                }
+            
+            logger.warning(f"账号创建未完成: {account.get('status')}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"创建账号异常: {e}")
+            return None
+    
     def refresh_account(self, email: str, max_wait: int = 300) -> Optional[Dict]:
         """
         请求刷新账号
-        - 注册服务会自动处理：
-          - 如果账号存在，直接刷新
-          - 如果账号不存在但域名匹配，自动创建并刷新
         返回刷新后的账号信息，失败返回None
         """
         try:
-            # 调用刷新接口
             url = f"{self.base_url}/api/accounts/{email}/refresh"
             resp = requests.post(url, headers=self._get_auth_headers(), timeout=30)
             
@@ -463,7 +531,6 @@ class AccountRefreshService:
             
             logger.info(f"账号 {email} 刷新请求已发送")
             
-            # 轮询等待刷新完成
             return self._wait_for_refresh(email, max_wait)
             
         except Exception as e:
@@ -507,13 +574,6 @@ class AccountRefreshService:
         
         logger.warning(f"账号 {email} 刷新超时")
         return None
-    
-    def batch_refresh(self, emails: List[str]) -> Dict[str, Optional[Dict]]:
-        """批量刷新账号"""
-        results = {}
-        for email in emails:
-            results[email] = self.refresh_account(email)
-        return results
 
 
 # ==================== 账号管理模块 ====================
@@ -530,10 +590,14 @@ class AccountState:
     updated_at: Optional[datetime] = None
     needs_refresh: bool = False
     refresh_in_progress: bool = False
+    exclude_from_batch_refresh: bool = False
+    last_refresh_failed: bool = False
+    request_count: int = 0  # 当前账号请求计数
+    refresh_retry_count: int = 0  # 刷新重试次数
 
 
 class AccountManager:
-    """账号池管理器 - 支持生命周期管理"""
+    """账号池管理器 - 支持生命周期管理和并发刷新"""
     
     def __init__(self, refresh_service: AccountRefreshService):
         self.accounts: List[Dict] = []
@@ -544,49 +608,147 @@ class AccountManager:
         self.refresh_queue = queue.Queue()
         self.refresh_thread: Optional[threading.Thread] = None
         self.running = True
+        self._data_version = 0
+        self._last_change_time = time.time()
+        
+        # 并发刷新线程池
+        self.refresh_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        
+        # 自动创建账号线程
+        self.auto_create_thread: Optional[threading.Thread] = None
+        self.auto_create_stop_event = threading.Event()
+    
+    def _notify_change(self):
+        """通知数据变化"""
+        self._data_version += 1
+        self._last_change_time = time.time()
+    
+    def get_data_version(self) -> Dict:
+        """获取数据版本信息"""
+        return {
+            "version": self._data_version,
+            "last_change": self._last_change_time
+        }
     
     def start_refresh_worker(self):
         """启动刷新工作线程"""
+        # 创建并发刷新线程池
+        max_workers = CONFIG["max_concurrent_refresh"]
+        self.refresh_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="RefreshWorker"
+        )
+        
         self.refresh_thread = threading.Thread(target=self._refresh_worker, daemon=True)
         self.refresh_thread.start()
         
-        # 启动生命周期检查线程
         check_thread = threading.Thread(target=self._lifecycle_checker, daemon=True)
         check_thread.start()
         
-        logger.info("账号刷新工作线程已启动")
+        # 启动自动创建账号线程
+        if CONFIG["auto_create_account"]:
+            self.start_auto_create_worker()
+        
+        logger.info(f"账号刷新工作线程已启动，最大并发数: {max_workers}")
+    
+    def start_auto_create_worker(self):
+        """启动自动创建账号线程"""
+        if self.auto_create_thread and self.auto_create_thread.is_alive():
+            return
+        
+        self.auto_create_stop_event.clear()
+        self.auto_create_thread = threading.Thread(target=self._auto_create_worker, daemon=True)
+        self.auto_create_thread.start()
+        logger.info(f"自动创建账号线程已启动，间隔: {CONFIG['auto_create_interval']} 秒")
+    
+    def stop_auto_create_worker(self):
+        """停止自动创建账号线程"""
+        self.auto_create_stop_event.set()
+        logger.info("自动创建账号线程已停止")
+    
+    def _auto_create_worker(self):
+        """自动创建账号工作线程"""
+        while not self.auto_create_stop_event.is_set():
+            try:
+                # 等待指定间隔
+                if self.auto_create_stop_event.wait(CONFIG["auto_create_interval"]):
+                    break  # 收到停止信号
+                
+                if not CONFIG["auto_create_account"]:
+                    continue
+                
+                logger.info("自动创建新账号...")
+                result = self.refresh_service.create_account()
+                
+                if result:
+                    account = {
+                        "team_id": result.get("team_id", ""),
+                        "secure_c_ses": result.get("secure_c_ses", ""),
+                        "host_c_oses": result.get("host_c_oses", ""),
+                        "csesidx": result.get("csesidx", ""),
+                        "user_agent": "Mozilla/5.0",
+                        "email": result.get("email", ""),
+                        "available": True,
+                        "created_at": result.get("created_at") or datetime.now().isoformat(),
+                        "updated_at": result.get("updated_at") or datetime.now().isoformat(),
+                    }
+                    self.add_account(account)
+                    logger.info(f"自动创建账号成功: {result.get('email')}")
+                else:
+                    logger.warning("自动创建账号失败")
+                    
+            except Exception as e:
+                logger.error(f"自动创建账号异常: {e}")
     
     def _refresh_worker(self):
-        """刷新工作线程"""
+        """刷新工作线程 - 使用线程池并发处理"""
         while self.running:
             try:
-                # 获取批量任务
-                batch = []
-                batch_size = CONFIG["refresh_batch_size"]
+                # 收集待刷新任务
+                tasks = []
+                max_concurrent = CONFIG["max_concurrent_refresh"]
                 
                 try:
+                    # 等待第一个任务
                     item = self.refresh_queue.get(timeout=5)
-                    batch.append(item)
+                    tasks.append(item)
                     
-                    # 尝试获取更多任务
-                    while len(batch) < batch_size:
+                    # 尝试获取更多任务，直到多到并发数
+                    while len(tasks) < max_concurrent:
                         try:
                             item = self.refresh_queue.get_nowait()
-                            batch.append(item)
+                            tasks.append(item)
                         except queue.Empty:
                             break
                             
                 except queue.Empty:
                     continue
                 
-                # 处理批量刷新
-                for account_idx in batch:
-                    self._do_refresh(account_idx)
+                if not tasks:
+                    continue
+                
+                # 使用线程池并发执行刷新
+                logger.info(f"开始并发刷新 {len(tasks)} 个账号")
+                futures = []
+                for task in tasks:
+                    if isinstance(task, tuple):
+                        account_idx, retry_count = task
+                    else:
+                        account_idx, retry_count = task, 0
+                    future = self.refresh_executor.submit(self._do_refresh, account_idx, retry_count)
+                    futures.append((account_idx, future))
+                
+                # 等待所有任务完成
+                for account_idx, future in futures:
+                    try:
+                        future.result(timeout=360)  # 6分钟超时
+                    except Exception as e:
+                        logger.error(f"账号 {account_idx} 刷新任务异常: {e}")
                     
             except Exception as e:
                 logger.error(f"刷新工作线程异常: {e}")
     
-    def _do_refresh(self, account_idx: int):
+    def _do_refresh(self, account_idx: int, retry_count: int = 0):
         """执行账号刷新"""
         with self.lock:
             if account_idx >= len(self.accounts):
@@ -596,22 +758,21 @@ class AccountManager:
             if not state:
                 return
             state.refresh_in_progress = True
+            state.refresh_retry_count = retry_count
+            self._notify_change()
         
         try:
-            # 使用邮箱作为刷新标识
             email = account.get("email")
             if not email:
-                # 如果没有邮箱，无法刷新
                 logger.warning(f"账号 {account_idx} 没有邮箱，无法刷新")
+                self._handle_refresh_failure(account_idx, "缺少邮箱", retry_count)
                 return
             
-            logger.info(f"开始刷新账号 {account_idx}: {email}")
+            logger.info(f"开始刷新账号 {account_idx}: {email} (重试次数: {retry_count})")
             
-            # 调用刷新服务 - 注册服务会自动处理账号不存在的情况
             result = self.refresh_service.refresh_account(email)
             
             if result:
-                # 更新账号信息
                 with self.lock:
                     if account_idx < len(self.accounts):
                         self.accounts[account_idx].update({
@@ -633,26 +794,148 @@ class AccountManager:
                             state.cooldown_until = None
                             state.cooldown_reason = ""
                             state.available = True
+                            state.last_refresh_failed = False
+                            state.request_count = 0
+                            state.refresh_retry_count = 0
                         
+                        self._notify_change()
                         logger.info(f"账号 {account_idx} ({email}) 刷新成功")
             else:
-                logger.warning(f"账号 {account_idx} ({email}) 刷新失败")
+                self._handle_refresh_failure(account_idx, "刷新服务返回失败", retry_count)
                 
         except Exception as e:
             logger.error(f"账号 {account_idx} 刷新异常: {e}")
+            self._handle_refresh_failure(account_idx, str(e), retry_count)
         finally:
             with self.lock:
                 state = self.states.get(account_idx)
                 if state:
                     state.refresh_in_progress = False
-
+                self._notify_change()
+    
+    def _handle_refresh_failure(self, account_idx: int, reason: str, retry_count: int = 0):
+        """处理刷新失败"""
+        max_retries = CONFIG["max_refresh_retries"]
+        
+        with self.lock:
+            state = self.states.get(account_idx)
+            if not state:
+                return
+            
+            if retry_count < max_retries:
+                # 还有重试机会，加入队列末尾
+                state.refresh_retry_count = retry_count + 1
+                state.needs_refresh = True
+                logger.warning(f"账号 {account_idx} 刷新失败，加入队列重试 ({retry_count + 1}/{max_retries}): {reason}")
+                self._notify_change()
+        
+        if retry_count < max_retries:
+            # 在锁外添加到队列
+            self.refresh_queue.put((account_idx, retry_count + 1))
+        else:
+            # 已达到最大重试次数，删除账号并创建新账号
+            logger.warning(f"账号 {account_idx} 刷新失败 {max_retries} 次，删除并创建新账号")
+            self._replace_failed_account(account_idx)
+    
+    def _replace_failed_account(self, account_idx: int):
+        """替换失败的账号"""
+        # 先删除失败的账号
+        with self.lock:
+            if account_idx >= len(self.accounts):
+                return
+            old_email = self.accounts[account_idx].get("email", "unknown")
+        
+        # 创建新账号
+        result = self.refresh_service.create_account()
+        
+        if result:
+            new_account = {
+                "team_id": result.get("team_id", ""),
+                "secure_c_ses": result.get("secure_c_ses", ""),
+                "host_c_oses": result.get("host_c_oses", ""),
+                "csesidx": result.get("csesidx", ""),
+                "user_agent": "Mozilla/5.0",
+                "email": result.get("email", ""),
+                "available": True,
+                "created_at": result.get("created_at") or datetime.now().isoformat(),
+                "updated_at": result.get("updated_at") or datetime.now().isoformat(),
+            }
+            
+            with self.lock:
+                if account_idx < len(self.accounts):
+                    # 替换账号
+                    self.accounts[account_idx] = new_account
+                    self.states[account_idx] = AccountState(
+                        created_at=datetime.now(),
+                        updated_at=datetime.now(),
+                    )
+                    self._notify_change()
+                    logger.info(f"账号 {account_idx} 已替换: {old_email} -> {result.get('email')}")
+                else:
+                    # 账号已被删除，添加新账号
+                    self.add_account(new_account)
+        else:
+            # 创建新账号也失败，禁用原账号
+            with self.lock:
+                state = self.states.get(account_idx)
+                if state:
+                    disable_time = CONFIG["refresh_fail_disable_time"]
+                    state.cooldown_until = time.time() + disable_time
+                    state.cooldown_reason = "刷新失败且无法创建新账号"
+                    state.available = False
+                    state.last_refresh_failed = True
+                    state.needs_refresh = False
+                    self._notify_change()
+            logger.error(f"账号 {account_idx} 刷新失败且无法创建新账号，已禁用")
+    
+    def handle_account_failure(self, account_idx: int, reason: str):
+        """处理账号请求失败 - 移除并加入刷新队列"""
+        with self.lock:
+            if account_idx >= len(self.accounts):
+                return
+            state = self.states.get(account_idx)
+            if not state:
+                return
+            
+            # 标记为不可用并加入刷新队列
+            state.available = False
+            state.cooldown_reason = reason
+            state.jwt = None
+            state.jwt_time = 0
+            state.session = None
+            state.request_count = 0
+            
+            if not state.refresh_in_progress and not state.needs_refresh:
+                state.needs_refresh = True
+                self._notify_change()
+                logger.warning(f"账号 {account_idx} 请求失败，加入刷新队列: {reason}")
+        
+        # 在锁外添加到队列
+        self.refresh_queue.put((account_idx, 0))
+    
+    def handle_jwt_test_failure(self, account_idx: int, reason: str):
+        """处理JWT测试失败 - 禁用12小时"""
+        with self.lock:
+            state = self.states.get(account_idx)
+            if state:
+                disable_time = CONFIG["refresh_fail_disable_time"]
+                state.cooldown_until = time.time() + disable_time
+                state.cooldown_reason = f"JWT测试失败: {reason}"
+                state.available = False
+                state.last_refresh_failed = True
+                state.jwt = None
+                state.jwt_time = 0
+                state.session = None
+                state.request_count = 0
+                self._notify_change()
+                logger.warning(f"账号 {account_idx} JWT测试失败，禁用 {disable_time} 秒: {reason}")
     
     def _lifecycle_checker(self):
         """生命周期检查线程"""
         while self.running:
             try:
                 self._check_account_lifetimes()
-                time.sleep(60)  # 每分钟检查一次
+                time.sleep(60)
             except Exception as e:
                 logger.error(f"生命周期检查异常: {e}")
     
@@ -671,10 +954,8 @@ class AccountManager:
                 if state.refresh_in_progress or state.needs_refresh:
                     continue
                 
-                # 获取最后更新时间
                 last_update = state.updated_at or state.created_at
                 if not last_update:
-                    # 从账号数据获取
                     updated_at_str = account.get("updated_at") or account.get("created_at")
                     last_update = parse_iso_datetime(updated_at_str)
                     if last_update:
@@ -683,14 +964,12 @@ class AccountManager:
                 if not last_update:
                     continue
                 
-                # 计算剩余时间
                 age = (now - last_update).total_seconds()
                 remaining = lifetime - age
                 
-                # 如果剩余时间小于提前刷新时间，加入刷新队列
                 if remaining <= refresh_before and remaining > 0:
                     state.needs_refresh = True
-                    self.refresh_queue.put(i)
+                    self.refresh_queue.put((i, 0))
                     logger.info(f"账号 {i} 即将过期（剩余 {int(remaining)} 秒），已加入刷新队列")
     
     def load_accounts(self, accounts: List[Dict]):
@@ -700,7 +979,6 @@ class AccountManager:
             self.states = {}
             
             for i, acc in enumerate(accounts):
-                # 解析时间
                 created_at = parse_iso_datetime(acc.get("created_at"))
                 updated_at = parse_iso_datetime(acc.get("updated_at"))
                 
@@ -710,8 +988,11 @@ class AccountManager:
                     cooldown_reason=acc.get("cooldown_reason", ""),
                     created_at=created_at,
                     updated_at=updated_at or created_at,
+                    exclude_from_batch_refresh=acc.get("exclude_from_batch_refresh", False),
+                    last_refresh_failed=acc.get("last_refresh_failed", False),
                 )
             
+            self._notify_change()
             logger.info(f"已加载 {len(accounts)} 个账号")
     
     def get_accounts_json(self) -> List[Dict]:
@@ -728,7 +1009,6 @@ class AccountManager:
                 if state.cooldown_until and state.cooldown_until > now:
                     cooldown_remaining = int(state.cooldown_until - now)
                 
-                # 计算生命周期剩余时间
                 lifetime_remaining = 0
                 last_update = state.updated_at or state.created_at
                 if last_update:
@@ -750,8 +1030,27 @@ class AccountManager:
                     "has_jwt": state.jwt is not None,
                     "created_at": state.created_at.isoformat() if state.created_at else "",
                     "updated_at": state.updated_at.isoformat() if state.updated_at else "",
+                    "exclude_from_batch_refresh": state.exclude_from_batch_refresh,
+                    "last_refresh_failed": state.last_refresh_failed,
+                    "request_count": state.request_count,
+                    "refresh_retry_count": state.refresh_retry_count,
                 })
             return result
+    
+    def get_full_accounts_export(self) -> List[Dict]:
+        """获取完整账号导出数据（包含敏感信息）"""
+        with self.lock:
+            accounts = []
+            for i, acc in enumerate(self.accounts):
+                state = self.states.get(i, AccountState())
+                accounts.append({
+                    **acc,
+                    "created_at": state.created_at.isoformat() if state.created_at else acc.get("created_at", ""),
+                    "updated_at": state.updated_at.isoformat() if state.updated_at else acc.get("updated_at", ""),
+                    "exclude_from_batch_refresh": state.exclude_from_batch_refresh,
+                    "last_refresh_failed": state.last_refresh_failed,
+                })
+            return accounts
     
     def _is_available(self, index: int) -> bool:
         """检查账号是否可用"""
@@ -770,8 +1069,45 @@ class AccountManager:
         available = sum(1 for i in range(total) if self._is_available(i))
         return total, available
     
+    def get_detailed_stats(self) -> Dict:
+        """获取详细统计"""
+        with self.lock:
+            total = len(self.accounts)
+            available = 0
+            updating = 0
+            disabled = 0
+            cooldown = 0
+            excluded = 0
+            
+            now = time.time()
+            for i in range(total):
+                state = self.states.get(i)
+                if not state:
+                    continue
+                
+                if state.exclude_from_batch_refresh:
+                    excluded += 1
+                
+                if state.refresh_in_progress:
+                    updating += 1
+                elif not state.available:
+                    disabled += 1
+                elif state.cooldown_until and state.cooldown_until > now:
+                    cooldown += 1
+                else:
+                    available += 1
+            
+            return {
+                "total": total,
+                "available": available,
+                "updating": updating,
+                "disabled": disabled,
+                "cooldown": cooldown,
+                "excluded_from_batch": excluded,
+            }
+    
     def get_next_account(self) -> Tuple[int, Dict]:
-        """轮询获取下一个可用账号"""
+        """轮询获取下一个可用账号（每个账号请求N次后切换）"""
         with self.lock:
             available_accounts = [
                 (i, acc) for i, acc in enumerate(self.accounts)
@@ -785,9 +1121,22 @@ class AccountManager:
                     raise NoAvailableAccountError(f"无可用账号，最近冷却结束约 {remaining} 秒后")
                 raise NoAvailableAccountError("无可用账号")
             
+            # 找到当前索引对应的账号
+            requests_per_account = CONFIG["requests_per_account"]
+            
+            # 确保current_index在有效范围内
             self.current_index = self.current_index % len(available_accounts)
             idx, account = available_accounts[self.current_index]
-            self.current_index = (self.current_index + 1) % len(available_accounts)
+            state = self.states.get(idx)
+            
+            if state:
+                state.request_count += 1
+                
+                # 如果当前账号已达到请求次数上限，切换到下一个
+                if state.request_count >= requests_per_account:
+                    state.request_count = 0
+                    self.current_index = (self.current_index + 1) % len(available_accounts)
+            
             return idx, account
     
     def _get_next_cooldown(self) -> Optional[float]:
@@ -810,6 +1159,8 @@ class AccountManager:
             state.jwt = None
             state.jwt_time = 0
             state.session = None
+            state.request_count = 0
+            self._notify_change()
             logger.warning(f"账号 {index} 进入冷却 {seconds} 秒: {reason}")
     
     def trigger_refresh(self, index: int):
@@ -820,9 +1171,12 @@ class AccountManager:
             state = self.states[index]
             if not state.refresh_in_progress and not state.needs_refresh:
                 state.needs_refresh = True
-                state.available = False  # 暂时禁用
-                self.refresh_queue.put(index)
+                state.available = False
+                state.request_count = 0
+                self._notify_change()
                 logger.info(f"账号 {index} 触发刷新（401错误）")
+        
+        self.refresh_queue.put((index, 0))
     
     def toggle_account(self, index: int) -> bool:
         """切换账号启用状态"""
@@ -834,8 +1188,21 @@ class AccountManager:
             if state.available:
                 state.cooldown_until = None
                 state.cooldown_reason = ""
+                state.last_refresh_failed = False
+                state.request_count = 0
+            self._notify_change()
             logger.info(f"账号 {index} 状态切换为: {'启用' if state.available else '禁用'}")
             return state.available
+    
+    def set_exclude_batch_refresh(self, index: int, exclude: bool) -> bool:
+        """设置账号是否排除批量刷新"""
+        with self.lock:
+            if index not in self.states:
+                return False
+            self.states[index].exclude_from_batch_refresh = exclude
+            self._notify_change()
+            logger.info(f"账号 {index} 批量刷新排除状态: {exclude}")
+            return True
     
     def update_account(self, index: int, data: Dict) -> bool:
         """更新账号信息"""
@@ -845,11 +1212,15 @@ class AccountManager:
             for key in ["team_id", "secure_c_ses", "host_c_oses", "csesidx", "user_agent", "email"]:
                 if key in data:
                     self.accounts[index][key] = data[key]
+            if "exclude_from_batch_refresh" in data:
+                self.states[index].exclude_from_batch_refresh = data["exclude_from_batch_refresh"]
             if index in self.states:
                 self.states[index].jwt = None
                 self.states[index].jwt_time = 0
                 self.states[index].session = None
                 self.states[index].updated_at = datetime.now()
+                self.states[index].request_count = 0
+            self._notify_change()
             logger.info(f"账号 {index} 信息已更新")
             return True
     
@@ -866,6 +1237,7 @@ class AccountManager:
                 else:
                     new_states[i] = self.states.get(i + 1, AccountState())
             self.states = new_states
+            self._notify_change()
             logger.info(f"账号 {index} 已删除")
             return True
     
@@ -881,7 +1253,9 @@ class AccountManager:
             self.states[idx] = AccountState(
                 created_at=created_at or datetime.now(),
                 updated_at=updated_at or created_at or datetime.now(),
+                exclude_from_batch_refresh=account.get("exclude_from_batch_refresh", False),
             )
+            self._notify_change()
             logger.info(f"新账号已添加，索引: {idx}")
             return idx
     
@@ -904,36 +1278,84 @@ class AccountManager:
             state = self.states.get(index, AccountState())
             state.jwt = jwt
             state.jwt_time = time.time()
+            # JWT获取成功，清除失败标记
+            if state.last_refresh_failed:
+                state.last_refresh_failed = False
+                state.available = True
+                state.cooldown_until = None
+                state.cooldown_reason = ""
             self.states[index] = state
+            self._notify_change()
         
         return jwt
     
-    def ensure_session(self, index: int, account: Dict) -> Tuple[str, str, str]:
-        """确保会话有效"""
+    def test_jwt(self, index: int) -> Tuple[bool, str]:
+        """测试账号JWT - 返回(成功, 消息)"""
+        with self.lock:
+            if index < 0 or index >= len(self.accounts):
+                return False, "账号不存在"
+            account = self.accounts[index].copy()
+        
+        try:
+            jwt = JWTManager.fetch_jwt(account)
+            # 成功，更新状态
+            with self.lock:
+                state = self.states.get(index)
+                if state:
+                    state.jwt = jwt
+                    state.jwt_time = time.time()
+                    if state.last_refresh_failed:
+                        state.last_refresh_failed = False
+                        state.available = True
+                        state.cooldown_until = None
+                        state.cooldown_reason = ""
+                    self._notify_change()
+            return True, "JWT获取成功"
+        except AccountError as e:
+            return False, str(e)
+        except Exception as e:
+            return False, str(e)
+    
+    def create_new_session(self, index: int, account: Dict) -> Tuple[str, str, str]:
+        """创建新会话（每次请求都创建新会话）"""
         jwt = self.ensure_jwt(index, account)
-        
-        with self.lock:
-            state = self.states.get(index)
-            if state and state.session:
-                return state.session, jwt, account.get("team_id", "")
-        
         session = SessionManager.create_session(jwt, account.get("team_id", ""))
-        
-        with self.lock:
-            if index in self.states:
-                self.states[index].session = session
-        
         return session, jwt, account.get("team_id", "")
     
-    def force_refresh_all(self):
+    def force_refresh_all(self, only_invalid: bool = False):
         """强制刷新所有账号"""
+        count = 0
         with self.lock:
             for i in range(len(self.accounts)):
                 state = self.states.get(i)
-                if state and state.available and not state.refresh_in_progress:
-                    state.needs_refresh = True
-                    self.refresh_queue.put(i)
-        logger.info("已将所有账号加入刷新队列")
+                if not state:
+                    continue
+                
+                # 如果排除批量刷新，跳过
+                if state.exclude_from_batch_refresh:
+                    continue
+                
+                # 如果正在刷新，跳过
+                if state.refresh_in_progress:
+                    continue
+                
+                # 如果只刷新无效账号
+                if only_invalid:
+                    is_invalid = (
+                        not state.available or
+                        (state.cooldown_until and state.cooldown_until > time.time()) or
+                        state.last_refresh_failed
+                    )
+                    if not is_invalid:
+                        continue
+                
+                state.needs_refresh = True
+                self.refresh_queue.put((i, 0))
+                count += 1
+        
+        mode = "无效账号" if only_invalid else "所有账号"
+        logger.info(f"已将 {count} 个{mode}加入刷新队列")
+        return count
 
 
 # ==================== 会话管理模块 ====================
@@ -1074,30 +1496,28 @@ class ChatService:
             try:
                 account_idx, account = self.account_manager.get_next_account()
                 
-                # 避免重复尝试同一账号
                 if account_idx in tried_accounts:
                     continue
                 tried_accounts.add(account_idx)
                 
                 logger.info(f"第 {retry + 1} 次尝试，使用账号 {account_idx}")
                 
-                session, jwt, team_id = self.account_manager.ensure_session(account_idx, account)
+                # 每次请求都创建新会话
+                session, jwt, team_id = self.account_manager.create_new_session(account_idx, account)
                 
-                # 上传用户图片
+                # 上传图片
                 file_ids = []
                 for img in images:
                     file_id = FileManager.upload_image(jwt, session, team_id, img)
                     if file_id:
                         file_ids.append(file_id)
                 
-                # 构建请求体并发送
                 body = MessageProcessor.build_request_body(
                     team_id, session, text, model, file_ids
                 )
                 
                 response = self._send_request(jwt, body)
                 
-                # 构建最终响应内容
                 content = self._build_response_content(response, jwt, team_id)
                 
                 return content, jwt, team_id
@@ -1105,13 +1525,8 @@ class ChatService:
             except AccountAuthError as e:
                 last_error = e
                 if account_idx is not None:
-                    # 401错误 - 触发刷新
-                    if e.status_code == 401:
-                        self.account_manager.trigger_refresh(account_idx)
-                    else:
-                        self.account_manager.set_cooldown(
-                            account_idx, str(e), CONFIG["cooldown"]["auth_error"]
-                        )
+                    # 认证错误，移除账号并加入刷新队列
+                    self.account_manager.handle_account_failure(account_idx, str(e))
                 logger.warning(f"账号 {account_idx} 凭证错误: {e}")
                 
             except AccountRateLimitError as e:
@@ -1124,9 +1539,8 @@ class ChatService:
             except AccountRequestError as e:
                 last_error = e
                 if account_idx is not None:
-                    self.account_manager.set_cooldown(
-                        account_idx, str(e), CONFIG["cooldown"]["generic_error"]
-                    )
+                    # 请求错误，移除账号并加入刷新队列
+                    self.account_manager.handle_account_failure(account_idx, str(e))
                 logger.warning(f"账号 {account_idx} 请求错误: {e}")
                 
             except NoAvailableAccountError as e:
@@ -1135,6 +1549,8 @@ class ChatService:
             except Exception as e:
                 last_error = e
                 logger.error(f"未知错误: {e}")
+                if account_idx is not None:
+                    self.account_manager.handle_account_failure(account_idx, str(e))
                 if account_idx is None:
                     break
         
@@ -1386,19 +1802,27 @@ def admin_login():
 @require_admin
 def get_status():
     """获取系统状态"""
-    total, available = account_manager.get_available_count()
+    stats = account_manager.get_detailed_stats()
+    version_info = account_manager.get_data_version()
+    
     return jsonify({
         "status": "ok",
         "timestamp": datetime.now().isoformat(),
-        "accounts": {"total": total, "available": available},
+        "accounts": stats,
         "models": list(CONFIG["models"].keys()),
         "config": {
             "account_lifetime": CONFIG["account_lifetime"],
             "refresh_before_expiry": CONFIG["refresh_before_expiry"],
-            "refresh_batch_size": CONFIG["refresh_batch_size"],
             "max_retries": CONFIG["max_retries"],
             "register_service_url": CONFIG["register_service_url"],
-        }
+            "refresh_fail_disable_time": CONFIG["refresh_fail_disable_time"],
+            "max_concurrent_refresh": CONFIG["max_concurrent_refresh"],
+            "requests_per_account": CONFIG["requests_per_account"],
+            "max_refresh_retries": CONFIG["max_refresh_retries"],
+            "auto_create_account": CONFIG["auto_create_account"],
+            "auto_create_interval": CONFIG["auto_create_interval"],
+        },
+        "data_version": version_info
     })
 
 
@@ -1414,12 +1838,15 @@ def get_accounts():
     start = (page - 1) * per_page
     end = start + per_page
     
+    version_info = account_manager.get_data_version()
+    
     return jsonify({
         "accounts": accounts[start:end],
         "total": total,
         "page": page,
         "per_page": per_page,
-        "total_pages": (total + per_page - 1) // per_page
+        "total_pages": (total + per_page - 1) // per_page,
+        "data_version": version_info
     })
 
 
@@ -1438,9 +1865,46 @@ def add_account():
         "available": True,
         "created_at": data.get("created_at") or datetime.now().isoformat(),
         "updated_at": data.get("updated_at") or datetime.now().isoformat(),
+        "exclude_from_batch_refresh": data.get("exclude_from_batch_refresh", False),
     }
     idx = account_manager.add_account(account)
     return jsonify({"success": True, "id": idx})
+
+
+@app.route('/api/accounts/create', methods=['POST'])
+@require_admin
+def create_new_account():
+    """创建新账号（调用注册服务）"""
+    data = request.json or {}
+    username = data.get("username")
+    
+    # 如果没有提供用户名，生成随机用户名
+    if not username:
+        username = generate_random_username()
+    
+    result = refresh_service.create_account(username)
+    
+    if result:
+        account = {
+            "team_id": result.get("team_id", ""),
+            "secure_c_ses": result.get("secure_c_ses", ""),
+            "host_c_oses": result.get("host_c_oses", ""),
+            "csesidx": result.get("csesidx", ""),
+            "user_agent": "Mozilla/5.0",
+            "email": result.get("email", ""),
+            "available": True,
+            "created_at": result.get("created_at") or datetime.now().isoformat(),
+            "updated_at": result.get("updated_at") or datetime.now().isoformat(),
+        }
+        idx = account_manager.add_account(account)
+        return jsonify({
+            "success": True,
+            "id": idx,
+            "email": result.get("email"),
+            "message": "账号创建成功"
+        })
+    else:
+        return jsonify({"success": False, "error": "创建账号失败"}), 500
 
 
 @app.route('/api/accounts/<int:account_id>', methods=['PUT'])
@@ -1470,6 +1934,17 @@ def toggle_account(account_id):
     return jsonify({"success": True, "available": available})
 
 
+@app.route('/api/accounts/<int:account_id>/exclude-batch', methods=['POST'])
+@require_admin
+def toggle_exclude_batch(account_id):
+    """切换账号批量刷新排除状态"""
+    data = request.json or {}
+    exclude = data.get("exclude", True)
+    if account_manager.set_exclude_batch_refresh(account_id, exclude):
+        return jsonify({"success": True, "exclude": exclude})
+    return jsonify({"error": "账号不存在"}), 404
+
+
 @app.route('/api/accounts/<int:account_id>/refresh', methods=['POST'])
 @require_admin
 def refresh_single_account(account_id):
@@ -1480,7 +1955,9 @@ def refresh_single_account(account_id):
         state = account_manager.states.get(account_id)
         if state and not state.refresh_in_progress:
             state.needs_refresh = True
-            account_manager.refresh_queue.put(account_id)
+            account_manager._notify_change()
+    
+    account_manager.refresh_queue.put((account_id, 0))
     return jsonify({"success": True, "message": "已加入刷新队列"})
 
 
@@ -1488,24 +1965,34 @@ def refresh_single_account(account_id):
 @require_admin
 def refresh_all_accounts():
     """刷新所有账号"""
-    account_manager.force_refresh_all()
-    return jsonify({"success": True, "message": "已将所有账号加入刷新队列"})
+    data = request.json or {}
+    only_invalid = data.get("only_invalid", False)
+    count = account_manager.force_refresh_all(only_invalid=only_invalid)
+    mode = "无效账号" if only_invalid else "所有账号（排除已设置的）"
+    return jsonify({
+        "success": True, 
+        "message": f"已将 {count} 个{mode}加入刷新队列",
+        "count": count
+    })
 
 
 @app.route('/api/accounts/<int:account_id>/test', methods=['GET'])
 @require_admin
 def test_account(account_id):
-    """测试账号"""
-    with account_manager.lock:
-        if account_id < 0 or account_id >= len(account_manager.accounts):
-            return jsonify({"success": False, "message": "账号不存在"}), 404
-        account = account_manager.accounts[account_id]
+    """测试账号JWT"""
+    success, message = account_manager.test_jwt(account_id)
     
-    try:
-        jwt = JWTManager.fetch_jwt(account)
-        return jsonify({"success": True, "message": "JWT获取成功"})
-    except AccountError as e:
-        return jsonify({"success": False, "message": str(e)})
+    if success:
+        return jsonify({"success": True, "message": message})
+    else:
+        # 测试失败，禁用账号
+        account_manager.handle_jwt_test_failure(account_id, message)
+        return jsonify({
+            "success": False, 
+            "message": message,
+            "disabled": True,
+            "disable_duration": CONFIG["refresh_fail_disable_time"]
+        })
 
 
 @app.route('/api/accounts/import', methods=['POST'])
@@ -1517,7 +2004,6 @@ def import_accounts():
     if not isinstance(accounts, list):
         return jsonify({"error": "无效的账号数据"}), 400
     
-    # 处理导入的账号，添加时间戳
     processed_accounts = []
     for acc in accounts:
         processed = {
@@ -1530,6 +2016,8 @@ def import_accounts():
             "available": acc.get("available", True),
             "created_at": acc.get("created_at") or datetime.now().isoformat(),
             "updated_at": acc.get("updated_at") or acc.get("created_at") or datetime.now().isoformat(),
+            "exclude_from_batch_refresh": acc.get("exclude_from_batch_refresh", False),
+            "last_refresh_failed": acc.get("last_refresh_failed", False),
         }
         processed_accounts.append(processed)
     
@@ -1541,16 +2029,45 @@ def import_accounts():
 @require_admin
 def export_accounts():
     """导出账号配置"""
-    with account_manager.lock:
-        accounts = []
-        for i, acc in enumerate(account_manager.accounts):
-            state = account_manager.states.get(i, AccountState())
-            accounts.append({
-                **acc,
-                "created_at": state.created_at.isoformat() if state.created_at else acc.get("created_at", ""),
-                "updated_at": state.updated_at.isoformat() if state.updated_at else acc.get("updated_at", ""),
-            })
-    return jsonify({"accounts": accounts})
+    accounts = account_manager.get_full_accounts_export()
+    version_info = account_manager.get_data_version()
+    return jsonify({
+        "accounts": accounts,
+        "data_version": version_info,
+        "export_time": datetime.now().isoformat()
+    })
+
+
+@app.route('/api/accounts/download', methods=['GET'])
+@require_admin
+def download_accounts():
+    """下载账号配置为JSON文件"""
+    accounts = account_manager.get_full_accounts_export()
+    version_info = account_manager.get_data_version()
+    
+    data = {
+        "accounts": accounts,
+        "data_version": version_info,
+        "export_time": datetime.now().isoformat()
+    }
+    
+    json_str = json.dumps(data, indent=2, ensure_ascii=False)
+    
+    response = Response(
+        json_str,
+        mimetype='application/json',
+        headers={
+            'Content-Disposition': f'attachment; filename=gemini_accounts_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
+        }
+    )
+    return response
+
+
+@app.route('/api/data-version', methods=['GET'])
+@require_admin
+def get_data_version():
+    """获取数据版本信息"""
+    return jsonify(account_manager.get_data_version())
 
 
 @app.route('/api/config', methods=['GET'])
@@ -1560,9 +2077,14 @@ def get_config():
     return jsonify({
         "account_lifetime": CONFIG["account_lifetime"],
         "refresh_before_expiry": CONFIG["refresh_before_expiry"],
-        "refresh_batch_size": CONFIG["refresh_batch_size"],
         "max_retries": CONFIG["max_retries"],
         "register_service_url": CONFIG["register_service_url"],
+        "refresh_fail_disable_time": CONFIG["refresh_fail_disable_time"],
+        "max_concurrent_refresh": CONFIG["max_concurrent_refresh"],
+        "requests_per_account": CONFIG["requests_per_account"],
+        "max_refresh_retries": CONFIG["max_refresh_retries"],
+        "auto_create_account": CONFIG["auto_create_account"],
+        "auto_create_interval": CONFIG["auto_create_interval"],
     })
 
 
@@ -1576,13 +2098,30 @@ def update_config():
         CONFIG["account_lifetime"] = int(data["account_lifetime"])
     if "refresh_before_expiry" in data:
         CONFIG["refresh_before_expiry"] = int(data["refresh_before_expiry"])
-    if "refresh_batch_size" in data:
-        CONFIG["refresh_batch_size"] = int(data["refresh_batch_size"])
     if "max_retries" in data:
         CONFIG["max_retries"] = int(data["max_retries"])
     if "register_service_url" in data:
         CONFIG["register_service_url"] = data["register_service_url"]
         refresh_service.base_url = data["register_service_url"].rstrip('/')
+    if "refresh_fail_disable_time" in data:
+        CONFIG["refresh_fail_disable_time"] = int(data["refresh_fail_disable_time"])
+    if "max_concurrent_refresh" in data:
+        CONFIG["max_concurrent_refresh"] = int(data["max_concurrent_refresh"])
+    if "requests_per_account" in data:
+        CONFIG["requests_per_account"] = int(data["requests_per_account"])
+    if "max_refresh_retries" in data:
+        CONFIG["max_refresh_retries"] = int(data["max_refresh_retries"])
+    if "auto_create_account" in data:
+        old_value = CONFIG["auto_create_account"]
+        CONFIG["auto_create_account"] = bool(data["auto_create_account"])
+        # 如果开启了自动创建，启动线程
+        if CONFIG["auto_create_account"] and not old_value:
+            account_manager.start_auto_create_worker()
+        # 如果关闭了自动创建，停止线程
+        elif not CONFIG["auto_create_account"] and old_value:
+            account_manager.stop_auto_create_worker()
+    if "auto_create_interval" in data:
+        CONFIG["auto_create_interval"] = int(data["auto_create_interval"])
     
     return jsonify({"success": True})
 
@@ -1607,8 +2146,11 @@ def main():
     logger.info(f"注册服务URL: {CONFIG['register_service_url']}")
     logger.info(f"账号生命周期: {CONFIG['account_lifetime']} 秒")
     logger.info(f"提前刷新时间: {CONFIG['refresh_before_expiry']} 秒")
-    logger.info(f"刷新批量大小: {CONFIG['refresh_batch_size']}")
-    logger.info(f"最大重试次数: {CONFIG['max_retries']}")
+    logger.info(f"最大并发刷新: {CONFIG['max_concurrent_refresh']}")
+    logger.info(f"每账号请求数: {CONFIG['requests_per_account']}")
+    logger.info(f"最大刷新重试: {CONFIG['max_refresh_retries']}")
+    logger.info(f"自动创建账号: {CONFIG['auto_create_account']}")
+    logger.info(f"自动创建间隔: {CONFIG['auto_create_interval']} 秒")
     logger.info(f"支持模型: {', '.join(CONFIG['models'].keys())}")
     logger.info("=" * 60)
     logger.info("API端点:")
@@ -1616,6 +2158,7 @@ def main():
     logger.info("  GET  /v1/models           - 模型列表")
     logger.info("  POST /v1/chat/completions - 聊天接口")
     logger.info("  GET  /                    - 管理面板")
+    logger.info(f"启动在: http://127.0.0.1:{CONFIG['port']}")
     logger.info("=" * 60)
     
     app.run(host='0.0.0.0', port=CONFIG["port"], debug=False)
@@ -1623,4 +2166,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
