@@ -1357,6 +1357,37 @@ class AccountManager:
         logger.info(f"已将 {count} 个{mode}加入刷新队列")
         return count
 
+    def stop_all_refreshes(self) -> int:
+        """强制停止所有刷新"""
+        count = 0
+        
+        # 1. 清空队列
+        while not self.refresh_queue.empty():
+            try:
+                self.refresh_queue.get_nowait()
+            except queue.Empty:
+                break
+        
+        # 2. 标记所有正在刷新或等待刷新的账号为禁用
+        with self.lock:
+            for i in range(len(self.accounts)):
+                state = self.states.get(i)
+                if not state:
+                    continue
+                
+                if state.refresh_in_progress or state.needs_refresh:
+                    state.refresh_in_progress = False
+                    state.needs_refresh = False
+                    state.available = False
+                    state.cooldown_reason = "强制停止刷新"
+                    state.last_refresh_failed = True  # 标记为失败以便用户注意
+                    count += 1
+            
+            self._notify_change()
+            
+        logger.warning(f"已强制停止刷新，涉及 {count} 个账号")
+        return count
+
 
 # ==================== 会话管理模块 ====================
 class SessionManager:
@@ -1961,19 +1992,33 @@ def refresh_single_account(account_id):
     return jsonify({"success": True, "message": "已加入刷新队列"})
 
 
-@app.route('/api/accounts/refresh-all', methods=['POST'])
-@require_admin
+@app.route("/api/accounts/refresh-all", methods=["POST"])
+@require_auth
 def refresh_all_accounts():
     """刷新所有账号"""
     data = request.json or {}
     only_invalid = data.get("only_invalid", False)
-    count = account_manager.force_refresh_all(only_invalid=only_invalid)
-    mode = "无效账号" if only_invalid else "所有账号（排除已设置的）"
-    return jsonify({
-        "success": True, 
-        "message": f"已将 {count} 个{mode}加入刷新队列",
-        "count": count
-    })
+    count = account_manager.force_refresh_all(only_invalid)
+    return jsonify({"success": True, "message": f"已触发 {count} 个账号刷新"})
+
+
+@app.route("/api/accounts/stop-refresh", methods=["POST"])
+@require_auth
+def stop_refresh():
+    """强制停止刷新"""
+    count = account_manager.stop_all_refreshes()
+    return jsonify({"success": True, "message": f"已强制停止刷新，涉及 {count} 个账号"})
+
+
+@app.route('/api/accounts/<int:account_id>/exclude-batch', methods=['POST'])
+@require_admin
+def toggle_exclude_batch(account_id):
+    """切换账号批量刷新排除状态"""
+    data = request.json or {}
+    exclude = data.get("exclude", True)
+    if account_manager.set_exclude_batch_refresh(account_id, exclude):
+        return jsonify({"success": True, "exclude": exclude})
+    return jsonify({"error": "账号不存在"}), 404
 
 
 @app.route('/api/accounts/<int:account_id>/test', methods=['GET'])
