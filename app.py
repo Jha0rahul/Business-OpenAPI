@@ -1993,7 +1993,7 @@ def refresh_single_account(account_id):
 
 
 @app.route("/api/accounts/refresh-all", methods=["POST"])
-@require_auth
+@require_admin
 def refresh_all_accounts():
     """刷新所有账号"""
     data = request.json or {}
@@ -2003,7 +2003,7 @@ def refresh_all_accounts():
 
 
 @app.route("/api/accounts/stop-refresh", methods=["POST"])
-@require_auth
+@require_admin
 def stop_refresh():
     """强制停止刷新"""
     count = account_manager.stop_all_refreshes()
