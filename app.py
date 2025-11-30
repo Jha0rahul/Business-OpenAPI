@@ -2010,17 +2010,6 @@ def stop_refresh():
     return jsonify({"success": True, "message": f"已强制停止刷新，涉及 {count} 个账号"})
 
 
-@app.route('/api/accounts/<int:account_id>/exclude-batch', methods=['POST'])
-@require_admin
-def toggle_exclude_batch(account_id):
-    """切换账号批量刷新排除状态"""
-    data = request.json or {}
-    exclude = data.get("exclude", True)
-    if account_manager.set_exclude_batch_refresh(account_id, exclude):
-        return jsonify({"success": True, "exclude": exclude})
-    return jsonify({"error": "账号不存在"}), 404
-
-
 @app.route('/api/accounts/<int:account_id>/test', methods=['GET'])
 @require_admin
 def test_account(account_id):
